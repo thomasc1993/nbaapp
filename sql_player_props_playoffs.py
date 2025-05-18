@@ -21,8 +21,7 @@ VIEW_SETUP_SQL = """
     CREATE TEMP VIEW IF NOT EXISTS player_season_playtypes_rs AS
     SELECT
         *
-    FROM   player_season_playtypes
-    WHERE  season_type = 'Regular Season';   -- ← the shift
+    FROM   player_season_playtypes;
 
 
  /* Regular-season per-game tracking numbers of the *current* season
@@ -48,8 +47,8 @@ VIEW_SETUP_SQL = """
         s.rc3_fgm AS rs_rc3_fgm
 
         FROM   player_tracking_stats  t
-        LEFT   JOIN player_shot_locations s ON  s.player_id = t.player_id AND s.season    = t.season AND s.season_type = 'Regular Season'
-        WHERE  t.season_type = 'Regular Season';
+        LEFT   JOIN player_shot_locations s ON  s.player_id = t.player_id AND s.season    = t.season
+        ;
 
 
     CREATE TEMP VIEW IF NOT EXISTS team_defense_tracking_rs_for_join AS
@@ -67,8 +66,7 @@ VIEW_SETUP_SQL = """
         lt_10_pct AS rs_tdt_lt_10_pct, ns_lt_10_pct AS rs_tdt_ns_lt_10_pct, gt15f_freq AS rs_tdt_gt15f_freq,
         gt15f_plusminus AS rs_tdt_gt15f_plusminus, fga_gt_15 AS rs_tdt_fga_gt_15, fgm_gt_15 AS rs_tdt_fgm_gt_15,
         gt_15_pct AS rs_tdt_gt_15_pct, ns_gt_15_pct AS rs_tdt_ns_gt_15_pct
-        FROM   team_defense_tracking
-        WHERE  season_type = 'Regular Season';
+        FROM   team_defense_tracking;
 
      CREATE TEMP VIEW IF NOT EXISTS vegas_odds_for_join AS
         SELECT
@@ -97,8 +95,7 @@ VIEW_SETUP_SQL = """
 
 
         FROM player_team_on_off_court
-        WHERE season_type = 'Regular Season'
-        AND court_status = 'On'
+        WHERE court_status = 'On'
         AND (group_set IS NULL OR group_set = 'On/Off Court');
 
 
@@ -118,8 +115,7 @@ VIEW_SETUP_SQL = """
 
 
         FROM player_team_on_off_court
-        WHERE season_type = 'Regular Season'
-        AND court_status = 'Off'
+        WHERE court_status = 'Off'
         AND (group_set IS NULL OR group_set = 'On/Off Court');
 """
 
@@ -174,11 +170,11 @@ PLAYER_GAMES_SQL = """
          LEFT JOIN    player_on_court_rs_for_join  onv
                 ON onv.player_id = op.player_id
                AND onv.team_id   = op.opponent_team_id
-               AND onv.season    = op.season
+               AND onv.season    = printf('%d-%02d', CAST(substr(op.season,1,4) AS INTEGER)-1, CAST(substr(op.season,6,2) AS INTEGER)-1)
          LEFT JOIN    player_off_court_rs_for_join offv
                 ON offv.player_id = op.player_id
                AND offv.team_id   = op.opponent_team_id
-               AND offv.season    = op.season
+               AND offv.season    = printf('%d-%02d', CAST(substr(op.season,1,4) AS INTEGER)-1, CAST(substr(op.season,6,2) AS INTEGER)-1)
          GROUP BY
              op.game_id,
              op.team_id,
@@ -201,7 +197,8 @@ PLAYER_GAMES_SQL = """
                 PARTITION BY pgf.player_id, pgf.season
                 ORDER BY     pgf.game_date, pgf.game_id
                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-            ) AS pts_season_avg
+            ) AS pts_season_avg,
+            pgf.prev_season AS prev_season
         FROM player_game_features pgf
     ),
     
@@ -609,15 +606,15 @@ PLAYER_GAMES_SQL = """
     JOIN players ps ON pgf.player_id = ps.player_id
     JOIN teams_game_features tgf ON pgf.game_id = tgf.game_id AND pgf.team_id = tgf.team_id
     JOIN teams_game_features otgf ON tgf.game_id = otgf.game_id AND tgf.opponent_team_id = otgf.team_id
-    LEFT JOIN player_tracking_rs_for_join  rts  ON rts.player_id = pgf.player_id AND rts.season = pgf.season
+    LEFT JOIN player_tracking_rs_for_join  rts  ON rts.player_id = pgf.player_id AND rts.season = pgf.prev_season
     LEFT JOIN player_game_advanced_tracking pgat ON pgat.player_id = pgf.player_id AND pgat.game_id = pgf.game_id
-    LEFT JOIN team_defense_tracking_rs_for_join tdt  ON tdt.team_id = pgf.opponent_team_id AND tdt.season   = pgf.season
+    LEFT JOIN team_defense_tracking_rs_for_join tdt  ON tdt.team_id = pgf.opponent_team_id AND tdt.season = pgf.prev_season
     LEFT JOIN vegas_odds_for_join vo ON vo.game_id = pgf.game_id AND vo.team_id = pgf.team_id
     LEFT JOIN opponent_vs_player ovp ON pgf.game_id = ovp.game_id AND pgf.opponent_team_id = ovp.opponent_team_id AND ps.position_number = ovp.position_number
-    LEFT JOIN player_on_court_rs_for_join   pon ON  pon.player_id = pgf.player_id AND pon.team_id = pgf.team_id AND pon.season = pgf.season
-    LEFT JOIN player_off_court_rs_for_join  poff ON  poff.player_id = pgf.player_id AND poff.team_id = pgf.team_id AND poff.season = pgf.season
+    LEFT JOIN player_on_court_rs_for_join   pon ON  pon.player_id = pgf.player_id AND pon.team_id = pgf.team_id AND pon.season = pgf.prev_season
+    LEFT JOIN player_off_court_rs_for_join  poff ON  poff.player_id = pgf.player_id AND poff.team_id = pgf.team_id AND poff.season = pgf.prev_season
     LEFT JOIN opponent_position_onoff_rs  opo ON  opo.game_id         = pgf.game_id AND  opo.team_id         = pgf.team_id AND  opo.position_number = ps.position_number    
-    LEFT JOIN star_players sp ON sp.season    = pgf.season AND sp.player_id = pgf.player_id
+    LEFT JOIN star_players sp ON sp.season    = pgf.prev_season AND sp.player_id = pgf.player_id
     LEFT JOIN star_out_flags sof ON sof.game_id = pgf.game_id AND sof.team_id = pgf.team_id
-    LEFT JOIN player_season_playtypes_rs pspt ON pspt.player_id = pgf.player_id AND pspt.season    = pgf.season
+    LEFT JOIN player_season_playtypes_rs pspt ON pspt.player_id = pgf.player_id AND pspt.season    = pgf.prev_season
 """

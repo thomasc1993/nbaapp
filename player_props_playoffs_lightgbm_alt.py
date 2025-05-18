@@ -2,9 +2,10 @@
 """
 player_props_playoffs_lightgbm_alt.py
 
-Trains a standalone LightGBM playoff player prop model using ONLY playoff data
-and derived features. This version does NOT use predictions from any
-other model as a feature.
+Standalone LightGBM player prop model.  Originally the model only trained on
+playoff games, but this version trains on **all** available game data (regular
+season + playoffs) while still utilising the playoff-specific feature pipeline.
+The model does not use predictions from any other model as a feature.
 
 MODIFIED: Includes pre-calculated career & season averages (shifted) for the target stat,
 and uses the season average as a default for the playoff career average when
@@ -1403,86 +1404,56 @@ class LightGBMPlayoffModel:
             season_avg_col: season_avg_shifted
         }, index=raw_df_all.index)
 
-        # 3. Filter for Playoff Games
-        logger.info("Filtering raw data for PLAYOFFS ONLY...")
-        if 'is_playoffs' not in raw_df_all.columns:
-            raise ValueError("'is_playoffs' column missing from raw data.")
-        if not pd.api.types.is_numeric_dtype(raw_df_all['is_playoffs']): # Ensure numeric for filter
-             raw_df_all['is_playoffs'] = pd.to_numeric(raw_df_all['is_playoffs'], errors='coerce').fillna(0)
+        # 3. Merge Career/Season PTS Averages onto the full dataset
+        logger.info("Using all available games (regular season + playoffs) for training.")
+        df_with_avgs = raw_df_all.join(averages_df, how='left')
 
-        # Keep original index when filtering for merging averages later
-        raw_df_playoffs = raw_df_all[raw_df_all['is_playoffs'] == 1].copy()
-        playoff_raw_rows = len(raw_df_playoffs)
-        if playoff_raw_rows == 0:
-            logger.warning("No playoff games found in the raw data. Cannot train.")
-            return {"error": "No playoff data found in source DB"}
-        logger.info(f"Using {playoff_raw_rows} playoff game rows for feature engineering and training.")
-
-        # 4. Merge Career/Season PTS Averages onto playoff data
-        # Use the index preserved from raw_df_all to merge the calculated averages
-        logger.info(f"Merging pre-calculated '{target_col}' averages onto playoff data...")
-        # Ensure indices align - should be okay as raw_df_playoffs is a slice of raw_df_all
-        df_playoffs_with_avgs = raw_df_playoffs.join(averages_df, how='left')
-
-        # Check merge success
-        if df_playoffs_with_avgs[career_avg_col].isnull().any() or df_playoffs_with_avgs[season_avg_col].isnull().any():
-             nan_career = df_playoffs_with_avgs[career_avg_col].isnull().sum()
-             nan_season = df_playoffs_with_avgs[season_avg_col].isnull().sum()
-             logger.warning(f"NaNs found after merging averages: {nan_career} in career_avg, {nan_season} in season_avg. Consider imputation if problematic.")
-             # Impute with 0 for now if needed (e.g., first game of career/season)
-             df_playoffs_with_avgs[career_avg_col] = df_playoffs_with_avgs[career_avg_col].fillna(0) # <-- CODE LINE 1
-             df_playoffs_with_avgs[season_avg_col] = df_playoffs_with_avgs[season_avg_col].fillna(0) # <-- CODE LINE 2
-
-        # 5. Playoff Feature cache (Operates ONLY on playoff data, now with merged averages)
-        # Cache key based on the raw playoff data hash (might not reflect merged cols - consider this)
-        # For simplicity, keep existing hash method. Rebuild cache if issues arise.
-        # The INPUT to feature_engineering is now df_playoffs_with_avgs
-        cache_key = f"{_hash_raw_df(raw_df_playoffs)}_{PLAYOFF_FEATURE_CACHE_VERSION}" # Base key on original playoff raw data
+        # 4. Feature cache (operates on the full dataset with merged averages)
+        cache_key = f"{_hash_raw_df(raw_df_all)}_{PLAYOFF_FEATURE_CACHE_VERSION}"
         cache_path = PLAYOFF_FEATURE_CACHE_DIR / f"features_playoffs_{cache_key}.parquet"
 
+        # Check merge success
+        if df_with_avgs[career_avg_col].isnull().any() or df_with_avgs[season_avg_col].isnull().any():
+             nan_career = df_with_avgs[career_avg_col].isnull().sum()
+             nan_season = df_with_avgs[season_avg_col].isnull().sum()
+             logger.warning(f"NaNs found after merging averages: {nan_career} in career_avg, {nan_season} in season_avg. Consider imputation if problematic.")
+             df_with_avgs[career_avg_col] = df_with_avgs[career_avg_col].fillna(0)
+             df_with_avgs[season_avg_col] = df_with_avgs[season_avg_col].fillna(0)
+
+        # 5. Feature cache (operates on the merged full dataset)
         if cache_path.exists() and not force_rebuild_cache:
             logger.info("Loading engineered PLAYOFF features from cache: %s", cache_path)
             df_engineered_playoffs = pd.read_parquet(cache_path)
-            # Ensure correct dtypes after loading
             if 'season' in df_engineered_playoffs.columns: df_engineered_playoffs['season'] = df_engineered_playoffs['season'].astype(str)
             if 'game_date' in df_engineered_playoffs.columns: df_engineered_playoffs['game_date'] = pd.to_datetime(df_engineered_playoffs['game_date'])
 
-            # *** Crucial: Merge the averages AGAIN after loading from cache ***
-            # Because the cached version doesn't contain the averages calculated in step 2.
             logger.info("Merging pre-calculated averages onto CACHED engineered playoff data...")
-            # Ensure indices align - cache should store index
-            if not df_engineered_playoffs.index.equals(df_playoffs_with_avgs.index):
-                 logger.warning("Cached playoff features index differs from playoff data index. Reindexing cached data.")
-                 # Reindex based on the index of the data that HAS the averages
-                 df_engineered_playoffs = df_engineered_playoffs.reindex(df_playoffs_with_avgs.index)
+            if not df_engineered_playoffs.index.equals(df_with_avgs.index):
+                 logger.warning("Cached playoff features index differs from data index. Reindexing cached data.")
+                 df_engineered_playoffs = df_engineered_playoffs.reindex(df_with_avgs.index)
 
-            # Select only the average columns to avoid duplication if FE somehow created them
             avg_cols_to_merge = [career_avg_col, season_avg_col]
-            df_engineered_playoffs = df_engineered_playoffs.drop(columns=avg_cols_to_merge, errors='ignore') # Drop if exist
-            df_engineered_playoffs = df_engineered_playoffs.join(df_playoffs_with_avgs[avg_cols_to_merge], how='left')
-            # Impute any NaNs potentially introduced by join/reindex mismatch
+            df_engineered_playoffs = df_engineered_playoffs.drop(columns=avg_cols_to_merge, errors='ignore')
+            df_engineered_playoffs = df_engineered_playoffs.join(df_with_avgs[avg_cols_to_merge], how='left')
             if df_engineered_playoffs[career_avg_col].isnull().any() or df_engineered_playoffs[season_avg_col].isnull().any():
                  logger.warning("NaNs found in averages after merging onto cached data. Imputing with 0.")
-                 # --- FIX: Use assignment instead of inplace=True ---
                  df_engineered_playoffs[career_avg_col] = df_engineered_playoffs[career_avg_col].fillna(0)
                  df_engineered_playoffs[season_avg_col] = df_engineered_playoffs[season_avg_col].fillna(0)
-                 # --- END FIX ---
 
         else:
-            logger.info("Playoff cache miss/rebuild — running feature engineering (on playoff data + merged avgs)...")
-            # Pass playoff data WITH merged averages to the feature engineering pipeline
-            df_engineered_playoffs = self.feature_engineering(df_playoffs_with_avgs) # This preserves index
+            logger.info("Playoff cache miss/rebuild — running feature engineering (on full data + merged avgs)...")
+            df_engineered_playoffs = self.feature_engineering(df_with_avgs)  # This preserves index
 
             logger.info("Writing engineered PLAYOFF features (excl. pre-calced avgs) to cache: %s", cache_path)
             try:
-                # Save WITHOUT the dynamically added averages, as they are recalculated/merged anyway
                 cols_to_cache = [c for c in df_engineered_playoffs.columns if c not in [career_avg_col, season_avg_col]]
                 if not cols_to_cache:
                      logger.warning("No columns left to cache after excluding averages.")
                 else:
-                     df_engineered_playoffs[cols_to_cache].to_parquet(cache_path, index=True) # Save index
+                     df_engineered_playoffs[cols_to_cache].to_parquet(cache_path, index=True)
             except Exception as e:
                  logger.error(f"Failed to write playoff feature cache: {e}", exc_info=True)
+
 
 
         # --- Subsequent steps operate on df_engineered_playoffs (which now includes the averages) ---
